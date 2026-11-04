@@ -2,13 +2,14 @@
 
 > 本地草稿／方案，供人工发布使用。以下文案与配图均为定稿，未包含视频。
 
-**一句话描述（README 首行）**
+**一句话描述（README 首行 / Tagline）**
 
 > 把 Mac 刘海变成随叫随到的播放与AirDrop入口。
+> Turn your Mac's notch into an on-demand player and AirDrop drop zone.
 
-**仓库 About 描述（详细版）**
+**仓库 About 描述（中英双语 / Repo description）**
 
-> 把 Mac 刘海变成随叫随到的播放与 AirDrop 入口：悬停展开封面、曲名与切歌，拖文件进刘海直接隔空投送；四档玻璃外观随封面取色，1.1 MB 纯单机，不联网、不抢焦点。
+> 把 Mac 刘海变成随叫随到的播放与AirDrop入口：悬停展开播放器，拖文件即可隔空投送。Turn the notch into an on-demand player and AirDrop drop zone — hover to play, drop to share.
 
 ## 一、发布文案（一页，可直接贴笔记正文）
 
