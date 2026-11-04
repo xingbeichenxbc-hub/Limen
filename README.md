@@ -2,8 +2,22 @@
 
 把 Mac 刘海变成随叫随到的播放与AirDrop入口。
 
-驻留刘海的音乐与隔空投送。鼠标移到刘海，面板从缺口下面长出来；移开就收回。
-`limen` 是拉丁语里的「门槛」——一条线，跨过去才是里面。
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="docs/images/01-cover.png" width="400" alt="01 封面"><br>01 封面</td>
+    <td align="center" width="50%"><img src="docs/images/02-hover.png" width="400" alt="02 悬停"><br>02 悬停</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/03-airdrop.png" width="400" alt="03 投掷"><br>03 投掷</td>
+    <td align="center"><img src="docs/images/04-glass.png" width="400" alt="04 原生"><br>04 原生</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/images/05-privacy.png" width="400" alt="05 克制"><br>05 克制</td>
+    <td align="center"><img src="docs/images/06-ending.png" width="400" alt="06 收尾"><br>06 收尾</td>
+  </tr>
+</table>
+
+六张配图均为 1080 × 1440 PNG，按 01 → 06 顺序使用；配图文案与发布文案收在 [docs/PROMO.md](docs/PROMO.md)。
 
 当前是 **beta 0.9.0**。功能已经稳定，缺的是正式签名与公证（见「已知限制」）。
 
@@ -12,80 +26,6 @@
 - 不占 Dock，不抢焦点，只有一个菜单栏图标
 
 [下载 Limen.dmg](https://github.com/xingbeichenxbc-hub/Limen/releases/tag/v0.9.0-beta) · [安装](#安装) · [权限](#权限) · [用法](#用法) · [设计笔记](#设计笔记)
-
----
-
-## 六张图，讲完 Limen
-
-以下六张配图与文案为定稿，均为 1080 × 1440 PNG，按 01 → 06 顺序使用，首图为封面。
-
-### 01 · 封面
-
-<p align="center"><img src="docs/images/01-cover.png" width="520" alt="01 封面"></p>
-
-刘海，此刻成为一扇传送门。
-
-拉丁语里，limen 意为「门槛」——跨过去，即是另一个空间。
-
-Limen　·　1.1 MB　·　不占 Dock
-
-### 02 · 悬停
-
-<p align="center"><img src="docs/images/02-hover.png" width="520" alt="02 悬停"></p>
-
-悬停，乐声入画。
-
-沉浸码字，或是专注于设计。手不必离开键盘区去翻找 Dock，目光也无需在控制中心里游离。
-
-只需将鼠标推向刘海。封面、曲名、切歌控制，自缺口下方顺畅滑落；移开光标，瞬间悄然隐退。
-
-它甚至不抢占窗口焦点。
-
-你正在敲下的字句、运行的代码，连光标都不会多闪一下。
-
-0.10 秒唤醒　·　165 × 97 pt　·　移开 0.08 秒收起
-
-### 03 · 投掷
-
-<p align="center"><img src="docs/images/03-airdrop.png" width="520" alt="03 投掷"></p>
-
-AirDrop，隔空即发。
-
-给手机传张截图，或是给同事发份文件。再也不需要多次右键点击分享，也不用去访达侧边栏里干等。
-
-抓起文件，随手甩进刘海。三侧边缘随即泛起一圈灵动的彩虹微光——松手，隔空投送就绪。
-
-### 04 · 原生
-
-<p align="center"><img src="docs/images/04-glass.png" width="520" alt="04 原生"></p>
-
-宛如原生。
-
-Limen 就像是系统出厂自带的一块精湛玻璃。
-
-四档材质：通透、标准、磨砂、专辑。自适应色调能敏锐感知当前播放的封面，晕开恰到好处的氛围光。
-
-### 05 · 克制
-
-<p align="center"><img src="docs/images/05-privacy.png" width="520" alt="05 克制"></p>
-
-极尽克制，深知分寸。
-
-最趁手的工具，往往最懂安静。
-
-- **彻底纯粹**：纯单机运行，零网络请求。不索要辅助功能，不要屏幕录制，不触碰磁盘文件。
-- **各司其职**：仅读取当前播放状态，绝不占用你的物理媒体按键。
-- **随时适应**：连上外接显示器，或在没有刘海的 Mac 上，它会安静收拢在菜单栏，随时待命。
-
-它不要的，比要的多。
-
-### 06 · 收尾
-
-<p align="center"><img src="docs/images/06-ending.png" width="520" alt="06 收尾"></p>
-
-跨过这道门槛。
-
-Limen　·　免费体验
 
 ---
 
@@ -405,14 +345,6 @@ cat /tmp/limen-drag.log     # 拖放事件（entered / updated nearTop / exited 
 在贴近窗口顶边时会往日志里写一行 `updated nearTop p=… ok=…`。
 下次再遇到「手甩到最上面光晕就没了」，先看这行：
 **没有记录**说明事件根本没进来（窗口之外）；**有记录但 ok=false** 是判定问题。
-
----
-
-## 宣传物料
-
-上方「六张图，讲完 Limen」即全部配图与配图文案；一页小红书发布文案、素材清单与人工发布检查表收在 [docs/PROMO.md](docs/PROMO.md)，按 01 → 06 顺序使用，首图为封面。
-
-图片均为 1080 × 1440 PNG，本次发布不含视频，安装镜像 `Limen.dmg` 随 Release 提供。
 
 ---
 
