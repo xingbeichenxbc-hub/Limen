@@ -1,31 +1,36 @@
 # Limen
 
 把 Mac 刘海变成随叫随到的播放与AirDrop入口。
+Turn your Mac's notch into an on-demand player and AirDrop drop zone.
+
+**[⬇ 下载 Limen.dmg / Download · 1.1 MB](https://github.com/xingbeichenxbc-hub/Limen/releases/download/v0.9.0-beta/Limen.dmg)**
+
+| 中文 | English |
+|---|---|
+| 悬停刘海，展开封面、曲名与切歌；移开即收 | Hover the notch for artwork, track info and playback controls; it retracts when you leave |
+| 把文件拖进刘海，直接隔空投送 | Drag a file onto the notch to AirDrop it |
+| 1.1 MB，纯单机，不联网，不抢焦点 | 1.1 MB, fully offline, never steals focus |
+
+---
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="docs/images/01-cover.png" width="400" alt="01 封面"><br>01 封面</td>
-    <td align="center" width="50%"><img src="docs/images/02-hover.png" width="400" alt="02 悬停"><br>02 悬停</td>
+    <td align="center" width="50%"><img src="docs/images/01-cover.png" width="400" alt="01 封面"><br>01 封面 / Cover</td>
+    <td align="center" width="50%"><img src="docs/images/02-hover.png" width="400" alt="02 悬停"><br>02 悬停 / Hover</td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/images/03-airdrop.png" width="400" alt="03 投掷"><br>03 投掷</td>
-    <td align="center"><img src="docs/images/04-glass.png" width="400" alt="04 原生"><br>04 原生</td>
+    <td align="center"><img src="docs/images/03-airdrop.png" width="400" alt="03 投掷"><br>03 投掷 / AirDrop</td>
+    <td align="center"><img src="docs/images/04-glass.png" width="400" alt="04 原生"><br>04 原生 / Native</td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/images/05-privacy.png" width="400" alt="05 克制"><br>05 克制</td>
-    <td align="center"><img src="docs/images/06-ending.png" width="400" alt="06 收尾"><br>06 收尾</td>
+    <td align="center"><img src="docs/images/05-privacy.png" width="400" alt="05 克制"><br>05 克制 / Restraint</td>
+    <td align="center"><img src="docs/images/06-ending.png" width="400" alt="06 收尾"><br>06 收尾 / Ending</td>
   </tr>
 </table>
 
-六张配图均为 1080 × 1440 PNG，按 01 → 06 顺序使用；配图文案与发布文案收在 [docs/PROMO.md](docs/PROMO.md)。
+**beta 0.9.0** · macOS 14+ · Apple Silicon / Intel · [宣传物料 / Promo copy](docs/PROMO.md)
 
-当前是 **beta 0.9.0**。功能已经稳定，缺的是正式签名与公证（见「已知限制」）。
-
-- 要求：macOS 14 或更新；Apple Silicon / Intel 都可以（通用二进制）
-- 形态：有刘海 → 贴着刘海；无刘海 / 外接屏 → 驻留菜单栏
-- 不占 Dock，不抢焦点，只有一个菜单栏图标
-
-[下载 Limen.dmg](https://github.com/xingbeichenxbc-hub/Limen/releases/tag/v0.9.0-beta) · [安装](#安装) · [权限](#权限) · [用法](#用法) · [设计笔记](#设计笔记)
+[安装 Install](#安装) · [权限 Permissions](#权限) · [用法 Usage](#用法) · [已知限制 Known Limitations](#已知限制)
 
 ---
 
