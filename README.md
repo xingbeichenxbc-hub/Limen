@@ -1,9 +1,13 @@
 # Limen
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/f56721ff-b5b2-4bd7-824e-2df12e624581" />
 
 把 Mac 刘海变成随叫随到的播放与AirDrop入口。
 Turn your Mac's notch into an on-demand player and AirDrop drop zone.
 
 **[⬇ 下载 Limen.dmg / Download · 1.4 MB](https://github.com/xingbeichenxbc-hub/Limen/releases/download/v0.11.2-beta/Limen.dmg)**
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d2dc7c1b-bde3-487d-b363-722c2fe02663" />
+
 
 | 中文 | English |
 |---|---|
