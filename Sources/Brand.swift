@@ -139,6 +139,8 @@ final class MenuBarController: NSObject {
         onStyle: @escaping (GlassStyle) -> Void,
         launchAtLogin: Bool,
         onToggleLaunchAtLogin: @escaping () -> Void,
+        batteryEnabled: Bool,
+        onToggleBattery: @escaping () -> Void,
         musicEnabled: Bool,
         onToggleMusic: @escaping () -> Void,
         onQuit: @escaping () -> Void
@@ -158,6 +160,10 @@ final class MenuBarController: NSObject {
         let login = actionItem("登录时启动", onToggleLaunchAtLogin)
         login.state = launchAtLogin ? .on : .off
         menu.addItem(login)
+
+        let battery = actionItem("电量显示", onToggleBattery)
+        battery.state = batteryEnabled ? .on : .off
+        menu.addItem(battery)
 
         let music = actionItem("播放时控制音乐", onToggleMusic)
         music.state = musicEnabled ? .on : .off

@@ -3,7 +3,11 @@ import SwiftUI
 
 /// 永不抢焦点的浮动面板。
 final class NotchPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    /// 平时绝不能成为 key window（否则它会把键盘从别的 App 那里抢走）。
+    /// 唯一的例外是倒计时输入框持焦时：只有 key window 能收到键盘输入。
+    /// 焦点一离开立刻改回 false。
+    var acceptsKey = false
+    override var canBecomeKey: Bool { acceptsKey }
     override var canBecomeMain: Bool { false }
 }
 
@@ -64,12 +68,19 @@ final class GateView: NSView {
         guard let host = contentHost else { return }
         let w = designSize.width > 0 ? designSize.width : bounds.width
         let h = designSize.height > 0 ? designSize.height : bounds.height
-        // AppKit 原点在左下：让内容的**顶边**贴住窗口顶边
+        // AppKit 原点在左下：让内容的**顶边**贴住窗口顶边。
+        //
+        // 左右和底边各留 `seamInset` 的透明余量。**这不是排版微调，是修一条黑边。**
+        // 卡片形状的裁剪边如果正好压在窗口边界上，窗口服务在那一列物理像素上
+        // 会把内容与窗口外的透明做一次合成，结果是一条近黑的缝——
+        // 白底实测 lum 0.12（卡片 0.78、背景 0.87），深底 0.02。
+        // 让裁剪发生在窗口**内部**，缝就没了；代价只是卡片窄 2pt（肉眼不可见）。
+        let seam = GlassTuning.seamInset
         host.frame = CGRect(
-            x: (bounds.width - w) / 2,
-            y: bounds.height - h,
-            width: w,
-            height: h
+            x: (bounds.width - w) / 2 + seam,
+            y: bounds.height - h + seam,
+            width: max(0, w - seam * 2),
+            height: max(0, h - seam * 2)
         )
     }
 
@@ -180,11 +191,18 @@ final class GateView: NSView {
 final class GlowView: NSView {
 
     let glow = NotchGlowLayer()
+    /// 倒计时的光团与发光路径。和彩虹光晕住在同一个不吃事件的窗口里，
+    /// 层级比面板高，所以面板弹出也不会遮住它。
+    let countdown = CountdownLayer()
+    /// 电量光条。优先级排在最后：投送彩虹与倒计时出现时它整体淡出。
+    let battery = BatteryLayer()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.addSublayer(glow)
+        layer?.addSublayer(battery)
+        layer?.addSublayer(countdown)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -192,6 +210,8 @@ final class GlowView: NSView {
     override func layout() {
         super.layout()
         glow.frame = bounds
+        battery.frame = bounds
+        countdown.frame = bounds
     }
 }
 
@@ -346,7 +366,9 @@ final class NotchGlowLayer: CALayer {
     /// 物理边缘还可能有 ±1pt 误差，左侧就明显偏了。
     /// 现在把线的一半埋进刘海（那里是物理挖空，画了也看不见），
     /// 内缘必然越界，任何方向 ±1pt 的误差都不会留缝。
-    private static func makeRingPath(size: CGSize, metrics: NotchMetrics) -> CGPath {
+    ///
+    /// 倒计时的光团走的也是这条轮廓（左上角 → 右 → 上 → 右上角），共用。
+    static func makeRingPath(size: CGSize, metrics: NotchMetrics) -> CGPath {
         let pad = metrics.glowPad
         let r = metrics.notchCornerRadius
 

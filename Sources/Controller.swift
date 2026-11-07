@@ -13,6 +13,16 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
     private var glowView: GlowView?
     private var metrics: NotchMetrics
     private var pollTimer: Timer?
+    private var countdownTimer: Timer?
+    private var batteryMonitor: BatteryMonitor?
+    /// 最近一次读到的电池状态。nil = 没有内置电池（台式机），什么都不画。
+    private var batteryStatus: BatteryStatus?
+    /// 演示用：`--battery-demo` 时用它盖住真实读数（截图/验证各档颜色）。
+    private var batteryDemoStatus: BatteryStatus?
+    /// 当前屏是否被全屏应用占着。全屏时电量光条整条隐去——
+    /// 刘海那块地方已经是视频/幻灯片的画布，再贴一条光就是干扰。
+    private var screenIsFullscreen = false
+    private var fullscreenTimer: Timer?
     private var expandJob: DispatchWorkItem?
     private var collapseJob: DispatchWorkItem?
     private var shrinkJob: DispatchWorkItem?
@@ -45,6 +55,41 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
     private let minVisibleDuration: TimeInterval = 0.30
 
     private let logEnabled = ProcessInfo.processInfo.environment["LIMEN_LOG"] == "1"
+
+    /// 系统当前是不是深色外观（`LIMEN_APPEARANCE` 只是调试覆盖）。
+    private var isDarkAppearance: Bool {
+        if let forced = AppearanceOverride.forced { return forced == .dark }
+        return NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+
+    /// 这张卡片看起来是不是深色的。
+    ///
+    /// 系统投影只在**卡片深色**时才关掉——因为那条近黑的贴边只有在
+    /// 「深卡片 + 深背景」时才会变成一条孤立可见的黑线；
+    /// 浅色卡片贴深背景时，那条暗线读起来是正常的描边，反而帮忙定轮廓。
+    ///
+    /// 专辑档的底色被钉在暗区间，所以它也算深色，同样要关。
+    /// 判断放在每次展开时刷新（卡片可能刚切到专辑档）。
+    /// 面板窗口要不要系统投影。默认**不要**。
+    ///
+    /// 系统投影能给出漂亮的悬浮感，但它在紧贴内容边缘的那一圈是近乎纯黑的核心
+    /// 暗环：白底实测 lum 0.12、深底 0.02，而周围是 0.78 / 0.16。
+    /// 这正好是那条「细细的黑边」，而且因为属于窗口服务而非内容，
+    /// 任何 SwiftUI 层都盖不掉。
+    ///
+    /// 现在改由卡片自己在内部画投影（见 `CardSurface.shadow`）：
+    /// 只向下、柔和、绝不贴边成环。
+    ///
+    /// `LIMEN_WINDOW_SHADOW=1` 可以把系统投影开回来做对比。
+    private var panelShouldCastShadow: Bool {
+        ProcessInfo.processInfo.environment["LIMEN_WINDOW_SHADOW"] == "1"
+    }
+
+    private var cardLooksDark: Bool {
+        if let forced = AppearanceOverride.forced { return forced == .dark }
+        if model.style.usesAlbumPalette, model.snapshot?.palette != nil { return true }
+        return isDarkAppearance
+    }
 
     /// 测试钩子：从文件读取"鼠标位置"（距屏幕顶部 pt）驱动状态机。
     /// 合成鼠标位置在部分环境下会被系统撤销，无法可靠模拟悬停。
@@ -150,6 +195,87 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         m.prepareForExpand(forceSettings: true)
         check("演示开关仍可强制停在设置页", m.cardMode == .settings, true)
 
+        // 倒计时：输入解析与钳制
+        let cm = NotchModel()
+        cm.setCountdownInput("1300")
+        check("倒计时·超上限钳制为 1200", cm.countdownInputText == "1200", true)
+        check("倒计时·钳制后输入框闪红", cm.countdownClampFlash, true)
+        check("倒计时·钳制后的 1200 可以开始", cm.countdownCanStart, true)
+        cm.setCountdownInput("0")
+        check("倒计时·0 不可开始", cm.countdownCanStart, false)
+        cm.setCountdownInput("-5")
+        check("倒计时·符号被滤除后留下数字", cm.countdownInputText == "5" && cm.countdownCanStart, true)
+        cm.setCountdownInput("abc")
+        check("倒计时·非数字不可开始", cm.countdownCanStart, false)
+        cm.setCountdownInput("")
+        check("倒计时·空输入不可开始", cm.countdownCanStart, false)
+        cm.setCountdownInput("1")
+        check("倒计时·下限 1 可开始", cm.countdownCanStart, true)
+
+        // 倒计时：开始 → 推进 → 到点
+        cm.setCountdownInput("25")
+        cm.startCountdown()
+        check("倒计时·开始后进入计时", cm.countdownPhase == .running, true)
+        cm.countdownTotal = 60
+        cm.countdownStart = Date().addingTimeInterval(-30)
+        _ = cm.tickCountdown()
+        check("倒计时·30/60 剩余 30", cm.countdownRemaining == 30, true)
+        check("倒计时·30/60 进度 0.5", abs(cm.countdownProgress - 0.5) < 0.01, true)
+        cm.countdownStart = Date().addingTimeInterval(-61)
+        let ended = cm.tickCountdown()
+        check("倒计时·到点转结束态", ended && cm.countdownPhase == .finished, true)
+        check("倒计时·结束态进度为 1", abs(cm.countdownProgress - 1) < 0.001, true)
+        cm.stopCountdown()
+        check("倒计时·关闭后回到空闲", cm.countdownPhase == .idle, true)
+
+        // 倒计时：计时进行中展开 → 停在倒计时页；空闲展开 → 主页面
+        cm.setCountdownInput("10")
+        cm.startCountdown()
+        cm.prepareForExpand()
+        check("倒计时·计时中展开停在倒计时页", cm.cardMode == .countdown, true)
+        cm.stopCountdown()
+        cm.prepareForExpand()
+        check("倒计时·空闲展开回到主页面", cm.cardMode == .main, true)
+
+        // 倒计时：历史最多 6 个、去重、最近在前
+        let hm = NotchModel()
+        for v in [10, 20, 30, 40, 50, 60, 70] {
+            hm.countdownInputText = String(v)
+            hm.startCountdown()
+            hm.stopCountdown()
+        }
+        check("倒计时·历史最多 6 个", hm.countdownHistory.count == 6, true)
+        check("倒计时·历史去重且最近在前", hm.countdownHistory == [70, 60, 50, 40, 30, 20], true)
+
+        // 倒计时：时间格式
+        check("倒计时·格式 mm:ss", CountdownFormat.clock(seconds: 305) == "05:05", true)
+        check("倒计时·格式 h:mm:ss", CountdownFormat.clock(seconds: 3661) == "1:01:01", true)
+
+        // 电量：分档阈值。40 及以上绿、20–40 偏黄绿、10–20 黄、10 及以下红。
+        // 边界（40 / 20 / 10）最容易写错，逐个钉住。
+        func bandOf(_ p: Int) -> BatteryStatus.Band {
+            BatteryStatus.demo(percent: p).band
+        }
+        check("电量·100% 绿", bandOf(100) == .green, true)
+        check("电量·40% 绿（含）", bandOf(40) == .green, true)
+        check("电量·39% 偏黄绿", bandOf(39) == .yellowGreen, true)
+        check("电量·20% 偏黄绿（含）", bandOf(20) == .yellowGreen, true)
+        check("电量·19% 黄", bandOf(19) == .yellow, true)
+        check("电量·11% 黄", bandOf(11) == .yellow, true)
+        check("电量·10% 红（含）", bandOf(10) == .red, true)
+        check("电量·1% 红", bandOf(1) == .red, true)
+
+        // 电量：充电 / 停充（满电或到达充电上限）的判定
+        let idle = BatteryStatus.demo(percent: 55)
+        let charging = BatteryStatus.demo(percent: 55, charging: true)
+        let full = BatteryStatus.demo(percent: 100, settled: true)
+        check("电量·用电池时不发光", idle.isOnAC == false && idle.isPulsing == false, true)
+        check("电量·充电中有脉冲", charging.isPulsing, true)
+        check("电量·充电中光条转白", charging.isWhite, true)
+        check("电量·满电不脉冲", full.isPulsing == false && full.isSettled, true)
+        check("电量·满电仍是白条", full.isWhite, true)
+        check("电量·用电池时不转白", idle.isWhite == false, true)
+
         print(failures == 0 ? "\n几何自检全部通过" : "\n几何自检 \(failures) 项失败")
         return failures
     }
@@ -157,6 +283,8 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
     func start() {
         buildPanel()
         wire()
+        startBattery()
+        startFullscreenWatch()
         if fake {
             // 演示曲目只在「音乐」开着时才显示；没显式关掉就当作开着，
             // 免得上一次 --music-off 留下的状态让截图变成一条提示。
@@ -205,6 +333,14 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
                 // 演示态：直接点亮光晕，便于截图与手感确认
                 startGlow()
             }
+            // 定时收起：demo 模式下没有悬停轮询，收起不会自己发生。
+            // 抓收起动画的帧必须用这个，不要靠移动鼠标。
+            if let t = ProcessInfo.processInfo.environment["LIMEN_COLLAPSE_AFTER"]
+                .flatMap(Double.init) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + t) { [weak self] in
+                    self?.collapse()
+                }
+            }
             // 只点亮光晕、不展开面板，用于按时间点抓帧验证
             if CommandLine.arguments.contains("--glow-demo") {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -231,6 +367,75 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
                 self.model.dropping = true
                 self.startGlow()
                 NSLog("[NB] drag-hold 开始（模拟拖拽中）")
+            }
+        }
+
+        // 倒计时演示：自动开始一段计时并展开弹窗（用于截图验证）。
+        // LIMEN_COUNTDOWN_MINUTES 指定分钟数（默认 5），
+        // LIMEN_COUNTDOWN_ELAPSED 假装已经过了多少秒（把光团摆到任意进度），
+        // LIMEN_COUNTDOWN_NO_EXPAND=1 只亮光团不弹面板（拍刘海轮廓用），
+        // LIMEN_COUNTDOWN_START_DELAY 先停在输入页 N 秒再开始（拍输入页用），
+        // LIMEN_COUNTDOWN_PAGE_DELAY 展开后停主页面 N 秒再切倒计时页
+        // （复现「点击入口按钮」的切页路径）。
+        if CommandLine.arguments.contains("--countdown-demo") {
+            let minutes = ProcessInfo.processInfo.environment["LIMEN_COUNTDOWN_MINUTES"]
+                .flatMap(Double.init) ?? 5
+            let elapsed = ProcessInfo.processInfo.environment["LIMEN_COUNTDOWN_ELAPSED"]
+                .flatMap(Double.init) ?? 0
+            let startDelay = ProcessInfo.processInfo.environment["LIMEN_COUNTDOWN_START_DELAY"]
+                .flatMap(Double.init) ?? 0
+            let pageDelay = ProcessInfo.processInfo.environment["LIMEN_COUNTDOWN_PAGE_DELAY"]
+                .flatMap(Double.init) ?? 0
+            let noExpand = ProcessInfo.processInfo.environment["LIMEN_COUNTDOWN_NO_EXPAND"] == "1"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                guard let self else { return }
+                // 演示不读音乐：避免触发 AppleScript 授权弹窗干扰截图
+                self.model.musicEnabled = false
+                self.model.countdownInputText = String(Int(minutes))
+                if !noExpand, self.metrics.mode == .notch { self.expandNow() }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9 + pageDelay) { [weak self] in
+                guard let self else { return }
+                // 模拟点了功能栏的小时钟：面板切到倒计时输入页
+                self.model.cardMode = .countdown
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9 + startDelay) { [weak self] in
+                guard let self else { return }
+                self.model.startCountdown()
+                if elapsed > 0 {
+                    self.model.countdownStart = Date().addingTimeInterval(-elapsed)
+                }
+            }
+        }
+        // 倒计时结束态演示：直接跳到「时间到」的发光跃动画面
+        if CommandLine.arguments.contains("--countdown-finish-demo") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                guard let self else { return }
+                self.model.countdownInputText = "3"
+                self.model.startCountdown()
+                self.model.countdownStart = Date().addingTimeInterval(-(self.model.countdownTotal + 1))
+                if self.model.tickCountdown() {
+                    self.glowView?.countdown.finish()
+                }
+                if self.metrics.mode == .notch { self.expandNow() }
+            }
+        }
+
+        // 焦点/激活循环演示：验证「面板成为 key window 再失焦」
+        // 会不会让玻璃材质状态变化（透明度 bug 排查用）。
+        // 与真实流程一致：先模拟点输入框持焦，再模拟点 ♪ 切回主页面——
+        // 后者必须经由 cardMode 的 didSet 自动清焦（透明 bug 的最后出口）。
+        if CommandLine.arguments.contains("--focus-demo") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self else { return }
+                self.model.countdownFieldFocused = true
+                self.model.onCountdownFocusChange?(true)
+                self.model.cardMode = .countdown
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+                guard let self else { return }
+                // 模拟点 ♪：切回主页面。焦点应由 cardMode.didSet 自动清掉。
+                self.model.cardMode = .main
             }
         }
 
@@ -266,6 +471,9 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         win.hasShadow = false
         win.ignoresMouseEvents = true
         win.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+        // 必须加入所有空间：Safari 全屏时占着独立空间，否则这块彩色背景
+        // 根本不出现，看玻璃就变成"白底上的一块白膜"，判断不了真假。
+        win.collectionBehavior = [.canJoinAllSpaces, .stationary]
         win.contentView = GlassBackdropView(frame: NSRect(origin: .zero, size: frame.size), colorful: colorful)
         win.orderFrontRegardless()
         backdropWindow = win
@@ -274,6 +482,11 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
     func stop() {
         pollTimer?.invalidate()
         pollTimer = nil
+        stopCountdownTimer()
+        batteryMonitor?.stop()
+        batteryMonitor = nil
+        fullscreenTimer?.invalidate()
+        fullscreenTimer = nil
         expandJob?.cancel()
         collapseJob?.cancel()
         shrinkJob?.cancel()
@@ -298,7 +511,19 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         p.isOpaque = false
         p.backgroundColor = .clear
-        p.hasShadow = false
+        // 投影只在浅色外观下开。
+        //
+        // 窗口是透明 + 内容是不透明圆角卡片，AppKit 会按内容 alpha 生成贴合
+        // 轮廓的阴影——浅色背景上这是"卡片浮起来"的关键，白玻璃贴白墙没有
+        // 投影等于不存在。
+        //
+        // 但**深色下它有副作用**：系统阴影紧贴内容边缘那一圈近乎纯黑
+        // （实测 lum 0.02，背景 0.15），在深色桌面上就是一条清晰的黑边，
+        // 而且这个值不可调。深色下改由卡片自己的底部内阴影交代层次
+        // （见 `CardSurface.thickness`），那条是画在卡片里的，不会出圈。
+        //
+        // **不用系统窗口投影。** 见 `panelShouldCastShadow`。
+        p.hasShadow = panelShouldCastShadow
         p.hidesOnDeactivate = false
         p.isMovable = false
         p.animationBehavior = .none
@@ -322,12 +547,18 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
             // 卡片顶部那层黑色渐隐正好压在光晕下沿外侧，会让光晕被啃掉一段。
             if self.model.expanded { self.collapse() }
             self.startGlow()
+            // 彩虹压上来，电量细线让路
+            self.syncBattery()
         }
         gate.onDragExit = { [weak self] in
             guard let self else { return }
             DragLog.write("[ctl] exit")
             self.model.dropping = false
             self.fadeOutGlow()
+            // 等彩虹淡完再露头，避免两圈光在同一帧交接
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.syncBattery()
+            }
             if self.model.expanded { self.scheduleCollapse(after: 0.4) }
         }
         gate.onDrop = { [weak self] urls in
@@ -339,7 +570,11 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
 
         let hosting = NSHostingView(rootView: RootView(model: model, metrics: metrics))
         hosting.wantsLayer = true
-        hosting.layer?.masksToBounds = true
+        // **不要**开 masksToBounds。裁剪已经由 SwiftUI 的 clipShape 完成；
+        // 这层额外的 layer 遮罩会在自己的边界上再做一次抗锯齿，
+        // 与窗口外的透明合成后，正好在卡片最外侧那一列物理像素上
+        // 留下一条近黑的缝（白底 0.12、深底 0.02）。实测关掉即消失。
+        hosting.layer?.masksToBounds = false
         gate.setContent(hosting, designSize: metrics.designSize)
 
         p.contentView = gate
@@ -374,11 +609,15 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         let v = GlowView(frame: CGRect(origin: .zero, size: f.size))
         v.autoresizingMask = [.width, .height]
         v.glow.configure(metrics: metrics, size: f.size)
+        v.countdown.configure(metrics: metrics, size: f.size)
+        v.battery.configure(metrics: metrics, size: f.size)
         w.contentView = v
         w.orderFrontRegardless()
 
         glowWindow = w
         glowView = v
+        syncCountdownVisuals()
+        syncBattery(animated: false)
         if logEnabled {
             NSLog("[NB] glow window frame=%@ ignoresMouse=%@",
                   NSStringFromRect(f), String(w.ignoresMouseEvents))
@@ -423,17 +662,194 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         media.onPermissionIssue = { [weak self] denied in self?.model.permissionHint = denied }
 
         model.onSetLaunchAtLogin = { [weak self] on in self?.applyLaunchAtLogin(on) }
+        // 设置页里的电量开关：只改可见性，不重启动画
+        model.onBatteryToggled = { [weak self] _ in self?.syncBattery() }
         model.onOpenAutomationSettings = {
             // Ventura 之后一直是这个锚点；打不开也不会影响别的功能
             let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!
             NSWorkspace.shared.open(url)
         }
+
+        // 倒计时
+        model.onCountdownStarted = { [weak self] in self?.countdownDidStart() }
+        model.onCountdownStopped = { [weak self] in self?.countdownDidStop() }
+        model.onCountdownFocusChange = { [weak self] focused in
+            self?.setCountdownFocus(focused)
+        }
+    }
+
+    // MARK: - 倒计时
+
+    /// 开始计时：驱动刘海光团的定时器起转，发光层从头开始
+    private func countdownDidStart() {
+        glowView?.countdown.startRunning()
+        startCountdownTimer()
+        syncBattery()
+    }
+
+    /// 结束计时（取消 / 关闭结束态）：定时器停转，发光层淡出
+    private func countdownDidStop() {
+        stopCountdownTimer()
+        glowView?.countdown.dismiss()
+        // 两条光交叉溶解：琥珀安静退场的同时电量细线浮上来，不空一拍
+        syncBattery()
+    }
+
+    /// 0.1s 一拍。进度按墙钟时间换算后**直接写值**（不走 CA 动画），
+    /// 机器睡眠、界面卡顿都不会让光团停摆；走完就切「吸气扩大」。
+    private func startCountdownTimer() {
+        stopCountdownTimer()
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.countdownTick()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        countdownTimer = t
+    }
+
+    private func stopCountdownTimer() {
+        countdownTimer?.invalidate()
+        countdownTimer = nil
+    }
+
+    private func countdownTick() {
+        let finished = model.tickCountdown()
+        if let layer = glowView?.countdown {
+            layer.showProgress(model.countdownProgress)
+            if finished { layer.finish() }
+        }
+        if finished { stopCountdownTimer() }
+    }
+
+    /// 输入框持焦时，面板临时获得键盘资格；失焦立刻交还。
+    /// 平时这块面板绝不做 key window，否则会把用户的键盘抢走。
+    private func setCountdownFocus(_ on: Bool) {
+        guard let panel else { return }
+        panel.acceptsKey = on
+        if logEnabled { NSLog("[NB] focus %@ key=%@", String(on), String(panel.isKeyWindow)) }
+        if on {
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKey()
+        } else {
+            panel.resignKey()
+            NSApp.deactivate()
+        }
+        if logEnabled { NSLog("[NB] focus done %@ key=%@ active=%@", String(on), String(panel.isKeyWindow), String(NSApp.isActive)) }
+    }
+
+    /// 窗口重建 / 换屏后，把发光层重新摆到当前进度。
+    /// 倒计时状态在 model 里，跟着走；发光层是新的，要补画。
+    private func syncCountdownVisuals() {
+        guard let layer = glowView?.countdown else { return }
+        switch model.countdownPhase {
+        case .idle:
+            break
+        case .running:
+            layer.showProgress(model.countdownProgress)
+        case .finished:
+            layer.finish()
+        }
+    }
+
+    // MARK: - 电量
+
+    /// 电量光条什么时候可以出现。
+    ///
+    /// 优先级：**隔空投送 > 倒计时 > 电量**。三样东西画的是同一条刘海轮廓，
+    /// 同时出现只会互相糊掉——投送彩虹最粗最满、倒计时有自己的光团和结束光环，
+    /// 电量最细，所以它让路。
+    ///
+    /// 注意这里只看「功能是否开着」和「有没有更高优先级的东西在发光」，
+    /// 不看面板展开与否：光条在刘海边缘，和下方的卡片不重叠。
+    private var batteryShouldShow: Bool {
+        guard metrics.mode == .notch, model.batteryEnabled else { return false }
+        // 全屏应用占着屏时整条隐去：那会儿刘海落在画面里，一条光就是干扰
+        guard !screenIsFullscreen else { return false }
+        guard !model.dropping, model.countdownPhase == .idle else { return false }
+        return true
+    }
+
+    private func syncBattery(animated: Bool = true) {
+        glowView?.battery.apply(batteryDemoStatus ?? batteryStatus,
+                                visible: batteryShouldShow,
+                                animated: animated)
+    }
+
+    private func startBattery() {
+        // 演示：用环境变量伪造读数，方便按档位截图
+        //   --battery-demo  LIMEN_BATTERY_LEVEL=87
+        //                   LIMEN_BATTERY_CHARGING=1 / LIMEN_BATTERY_SETTLED=1
+        if CommandLine.arguments.contains("--battery-demo") {
+            let env = ProcessInfo.processInfo.environment
+            let percent = env["LIMEN_BATTERY_LEVEL"].flatMap(Int.init) ?? 87
+            let charging = env["LIMEN_BATTERY_CHARGING"] == "1"
+            let settled = env["LIMEN_BATTERY_SETTLED"] == "1"
+            batteryDemoStatus = BatteryStatus.demo(percent: percent,
+                                                   charging: charging,
+                                                   settled: settled)
+            model.batteryEnabled = true
+            syncBattery(animated: false)
+            return
+        }
+
+        let m = BatteryMonitor()
+        m.onChange = { [weak self] status in
+            guard let self else { return }
+            if self.logEnabled {
+                NSLog("[NB] battery %@", status.map {
+                    "\($0.percent)% ac=\($0.isOnAC) charging=\($0.isCharging) settled=\($0.isSettled)"
+                } ?? "nil")
+            }
+            self.batteryStatus = status
+            self.syncBattery()
+        }
+        m.start()
+        batteryMonitor = m
+    }
+
+    // MARK: - 全屏
+
+    /// 起一个低频轮询盯着全屏状态。
+    ///
+    /// 不能只靠通知：进出全屏会发 `activeSpaceDidChange`，但同一个 Space 里
+    /// 用绿色按钮进出全屏、视频自己切全屏、外接屏单独全屏这些路径并不都发。
+    /// 0.5s 一次几何判断，成本就是扫一遍十几个窗口的 bounds。
+    private func startFullscreenWatch() {
+        refreshFullscreen()
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.refreshFullscreen()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        fullscreenTimer = t
+
+        // 空间切换后立刻复核一次（等一拍，让窗口层级落定）
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.refreshFullscreen() }
+        }
+    }
+
+    private func refreshFullscreen() {
+        // 电量光条关着的时候不用扫窗口——这一步每个 tick 都要列一遍所有窗口
+        guard model.batteryEnabled else {
+            if screenIsFullscreen { screenIsFullscreen = false }
+            return
+        }
+        // 调试钩子：`LIMEN_FORCE_FULLSCREEN=1` 假装全屏，用来验证「隐去」这条路
+        let full = ProcessInfo.processInfo.environment["LIMEN_FORCE_FULLSCREEN"] == "1"
+            || FullscreenProbe.isFullscreen(on: metrics.screen)
+        guard full != screenIsFullscreen else { return }
+        screenIsFullscreen = full
+        if logEnabled { NSLog("[NB] fullscreen=%@", String(full)) }
+        syncBattery()
     }
 
     // MARK: - 悬停
 
     private func startPolling() {
-        guard !demo && !dropDemo && !glassDemo && !lightDemo else { return }
+        let countdownDemo = CommandLine.arguments.contains("--countdown-demo")
+            || CommandLine.arguments.contains("--countdown-finish-demo")
+        guard !demo && !dropDemo && !glassDemo && !lightDemo && !countdownDemo else { return }
         let t = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
             self?.pollMouse()
         }
@@ -655,6 +1071,10 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         // 换页发生在看不见的时候，不会有内容突变的闪动。
         model.prepareForExpand(forceSettings: forceSettingsPage)
 
+        // 投影按「卡片是否深色」逐次决定：用户可能刚切到专辑档，
+        // 或在系统设置里换了外观。此刻卡片高度是 0，改阴影看不见。
+        if let p = panel { p.hasShadow = panelShouldCastShadow }
+
         // 先把窗口长到完整尺寸，再让内容开始动画。
         // 此刻卡片高度还是 0，所以"窗口变大"这一步看不见；
         // 反过来先动画后长窗口，卡片就会被窗口边缘裁掉。
@@ -662,6 +1082,12 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         model.expanded = true
         // 用户可能在「系统设置 › 登录项」里改过，展开时顺手对一次
         model.launchAtLogin = LaunchAtLogin.isEnabled
+
+        // 展开 = 用户正看着这块地方。如果这一首的封面还没拿到，
+        // 立刻插一次重试（不等退避）——这是「封面晚到」唯一的补救时机：
+        // 退避可以等 30 秒，人不会对着空白封面等 30 秒。
+        media.retryArtworkNow()
+
         if logEnabled { NSLog("[NB] EXPAND mode=%@", metrics.mode.rawValue) }
     }
 
@@ -702,6 +1128,8 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
                 guard let self else { return }
                 self.applyLaunchAtLogin(!self.model.launchAtLogin)
             },
+            batteryEnabled: model.batteryEnabled,
+            onToggleBattery: { [weak self] in self?.model.batteryEnabled.toggle() },
             musicEnabled: model.musicEnabled,
             onToggleMusic: { [weak self] in
                 guard let self else { return }
@@ -777,6 +1205,11 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
 
     private func collapse() {
         guard model.expanded else { return }
+        // 面板收起时输入框必须失焦：键盘资格立刻交还，
+        // 不能出现「面板没了，打字还被吞掉」的情况。
+        if model.countdownFieldFocused {
+            model.countdownFieldFocused = false
+        }
         model.expanded = false
         // 窗口要等收起动画放完再缩。立刻缩会把还在动的卡片一刀切掉。
         scheduleShrink()
@@ -806,6 +1239,10 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         let f = metrics.glowFrame
         glowWindow.setFrame(f, display: false)
         glowView.glow.configure(metrics: metrics, size: f.size)
+        glowView.countdown.configure(metrics: metrics, size: f.size)
+        glowView.battery.configure(metrics: metrics, size: f.size)
+        syncCountdownVisuals()
+        syncBattery(animated: false)
     }
 
     private func scheduleShrink() {
@@ -816,8 +1253,11 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
             self.applyWindowFrame(expanded: false)
         }
         shrinkJob = job
-        // 收起弹簧约 0.24s 响应、阻尼 0.95，0.45s 时已经彻底停住
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: job)
+        // 收起弹簧约 0.24s 响应、阻尼 0.95，0.45s 时已经彻底停住。
+        // 慢放调试时窗口也要跟着等，否则卡片会被窗口提前切掉。
+        let scale = ProcessInfo.processInfo.environment["LIMEN_ANIM_SLOW"]
+            .flatMap(Double.init) ?? 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45 * scale, execute: job)
     }
 
     private func cancelShrink() {
@@ -879,6 +1319,11 @@ final class NotchController: NSObject, NSSharingServiceDelegate {
         // 同时开始的话，"闪"和系统窗口会糊成一团，先后才有先后感。
         burstGlow()
 
+        // 爆闪收完（0.28s）再让电量细线回来，别在半空中撞上
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            self?.syncBattery()
+        }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
             NSApp.activate(ignoringOtherApps: true)
             service.perform(withItems: urls)
@@ -921,7 +1366,14 @@ final class GlassBackdropView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if !colorful {
-            // 纯白：用来检查卡片的黑角有没有顶出刘海圆角
+            // 纯白：用来检查卡片的黑角有没有顶出刘海圆角。
+            // `LIMEN_DARK_BACKDROP=1` 换成深灰，用来复现深色桌面下的边缘问题
+            // （深色外观 + 白底是看不到那条黑边的）。
+            if ProcessInfo.processInfo.environment["LIMEN_DARK_BACKDROP"] == "1" {
+                NSColor(white: 0.16, alpha: 1).setFill()
+                bounds.fill()
+                return
+            }
             NSColor.white.setFill()
             bounds.fill()
             return

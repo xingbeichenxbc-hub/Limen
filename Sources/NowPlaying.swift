@@ -12,6 +12,15 @@ struct NowPlayingSnapshot {
     var palette: AlbumPalette?
 }
 
+/// 一次封面读取的结果。
+/// 把「播放器说这首没有图」和「这次没读成」分开，是整块逻辑的地基：
+/// 前者可以慢慢重试，后者必须尽快重试，而两者都**不能**被当成结论。
+enum ArtworkRead {
+    case image(NSImage)
+    case noArtwork
+    case failed(String)
+}
+
 /// 通过 AppleScript 读取正在播放的媒体。
 /// 目前支持「音乐 Music」与「Spotify」——这两个覆盖了绝大多数本地播放场景。
 /// 后续若要支持浏览器等任意播放源，需要在运行时接 MediaRemote（私有接口，稳定性差），
@@ -109,122 +118,176 @@ final class NowPlayingService {
         )
         guard supportsArtwork else { return snap }
         return attachArtwork(snap, key: "\(tag)|\(snap.title)|\(snap.artist)") {
-            self.fetchArtwork { self.artworkScriptMusic() }
+            probeArtwork(expectedTitle: snap.title)
         }
     }
 
     // MARK: - 封面
 
-    /// 已经「下过结论」的曲目。结论可以是「拿到封面」，
-    /// 也可以是「确定这一首没有封面」——后者要记住，否则没封面的歌会让
-    /// 脚本每 2 秒空跑一次。
+    /// 真的拿到过封面的那一首（`tag|曲名|歌手`）。
+    /// **只有成功才写这里。**「没拿到」永远不是结论，只是这一次没成——
+    /// 一旦把「没拿到」记成结论，封面就再也回不来了，直到再换一首歌。
     private var resolvedArtworkKey = ""
 
-    /// 当前正在重试的那首，以及试了几次、从什么时候开始试。
-    /// 这三个字段必须绑定同一首歌，换曲时要一起清零，
-    /// 否则上一首的失败次数会算到下一首头上。
-    private var missKey = ""
-    private var artworkMisses = 0
-    private var artworkMissSince = Date()
+    /// 当前这首的重试状态。换曲时整体重置。
+    private var attemptKey = ""
+    private var attempts = 0
 
-    /// 一首歌最多试几次就认定「它没有封面」。
-    /// 6 次 ≈ 12 秒，够播放器把封面解出来，又不会无限空转。
-    private static let maxArtworkMisses = 6
-    private static let artworkGiveUpAfter: TimeInterval = 12
+    /// 下一次允许尝试的时刻（指数退避）。
+    ///
+    /// 这个节流是「点下一首没有封面」的真正成因。切歌之后 `control()` 会在
+    /// 0.35 / 0.9 / 1.6 秒各强制刷一拍——而这三拍几乎必然早于封面就绪，
+    /// 它们注定失败。早前的写法把「一首歌最多试 6 次」直接套在轮询次数上，
+    /// 于是这三拍就白烧掉一半预算，真正的重试窗口只剩到第 6 秒；
+    /// 而键盘切歌没有这几拍抢跑，6 次全落在 2 秒的常规轮询上，能撑到第 12 秒。
+    /// 这正是「键盘切歌有时正常、点按钮几乎必现」的来源：
+    /// 不是读取方式不同，是**重试预算被抢跑的几拍吃掉了**。
+    ///
+    /// 现在改成按时间退避（0.5 → 1 → 2 → 4 → 8 → 10 秒封顶），
+    /// 抢跑的那几拍只会落在退避窗口里被直接跳过，不再消耗任何预算。
+    private var nextAttemptAt = Date.distantPast
+
+    /// 退避上限。不再有「放弃」这个终态之后，间隔必须封顶，
+    /// 否则一首真的没有封面的歌会一路退避到几分钟才试一次。
+    /// 封顶 10 秒：比常规轮询（2 秒）稀疏，但封面一旦晚到，
+    /// 最多 10 秒就能自己补上，不用等换歌。
+    private static let artworkRetryCap: TimeInterval = 10
 
     /// 把封面挂到快照上。
     ///
-    /// **只有真的拿到图，才把 key 记成已解决。**
-    ///
-    /// 这是「点下一首没有封面」的根因。点下一首之后，播放器的 current track
-    /// 立刻变成新歌，但 artwork 往往还要几十到几百毫秒才就绪，这时候读
-    /// 只能拿到空数据。早前的写法在读失败时也把 key 提交了，于是下一次轮询
-    /// 看到 key 相同，直接跳过封面读取、把 nil 当作答案返回——封面就再也不
-    /// 出现，直到再换一首歌才有机会重试。
-    ///
-    /// 这也解释了为什么「键盘切歌有时正常、点按钮几乎必现」：`control()` 在
-    /// 0.35 秒后强制刷新一次，这个时机几乎必然早于封面就绪；而键盘切歌只能
-    /// 撞上 2 秒的常规轮询，反而经常落在封面就绪之后。
-    ///
-    /// 现在改成：没拿到就留着重试，但设上限（见 `maxArtworkMisses`）。
+    /// 不变式：**key 只在真的拿到图时才提交**；失败只影响「下一次什么时候再试」，
+    /// 不影响「这一首是不是还有机会」。
     private func attachArtwork(
         _ snap: NowPlayingSnapshot,
         key: String,
-        fetch: () -> String?
-    ) -> NowPlayingSnapshot {        var s = snap
+        fetch: () -> ArtworkRead
+    ) -> NowPlayingSnapshot {
+        var s = snap
 
-        // 这一首已经有结论了：直接用缓存，可能是「确实没有封面」
-        if key == resolvedArtworkKey {
+        // 这一首已经拿到过封面：直接用缓存
+        if key == resolvedArtworkKey, cachedArtwork != nil {
             s.artwork = cachedArtwork
             s.palette = cachedPalette
             return s
         }
 
-        // 换了一首（或仍是上次没读成的那首）：只有换歌才重置重试计数
-        if key != missKey {
-            missKey = key
-            artworkMisses = 0
-            artworkMissSince = Date()
+        // 换了一首：重试计数、退避时刻、缓存图全部归零
+        if key != attemptKey {
+            attemptKey = key
+            attempts = 0
+            nextAttemptAt = .distantPast
+            cachedArtwork = nil
+            cachedPalette = nil
         }
+
+        // 还在退避窗口里：这一拍不读脚本，只把「暂时没有封面」交出去。
+        // 界面照常跟着曲目信息刷新，但不会有任何一次读取被白白浪费。
+        guard Date() >= nextAttemptAt else {
+            s.artwork = nil
+            s.palette = nil
+            return s
+        }
+        attempts += 1
 
         // 先删掉上一首留下的文件。否则这一首读失败时，
         // 下面那句 NSImage(contentsOfFile:) 会捡起旧图当成新封面。
         try? FileManager.default.removeItem(atPath: artworkPath)
 
-        var image: NSImage?
-        if let title = fetch(), title == snap.title,
-           let img = NSImage(contentsOfFile: artworkPath), img.size.width > 1 {
-            image = img
-        }
-        // 读完就擦掉，别让封面图一直躺在临时目录里
-        try? FileManager.default.removeItem(atPath: artworkPath)
-
-        if let img = image {
+        let result = fetch()
+        lastArtworkReason = result
+        switch result {
+        case .image(let img):
             cachedArtwork = img
             // 配色只在换封面时算一次，之后跟着快照走，
             // 避免每 2 秒轮询都重新做一次像素统计。
             cachedPalette = AlbumPalette.extract(from: img)
             resolvedArtworkKey = key
-            artworkMisses = 0
-            if logEnabled {
-                NSLog("[NP] artwork ok key=%@ tries=%d", key, artworkMisses)
-            }
-        } else {
-            // 关键：**不提交 key**，下一次轮询继续试
+            attempts = 0
+            nextAttemptAt = .distantPast
+            if logEnabled { NSLog("[NP] artwork ok key=%@", key) }
+
+        case .noArtwork, .failed:
+            // 两种失败都不提交 key。区别在起跳间隔上：
+            // 播放器说「这首没有图」时慢慢试（2 秒起跳），
+            // 脚本报错/超时这类临时故障尽快再来（0.5 秒起跳）。
             cachedArtwork = nil
             cachedPalette = nil
-            artworkMisses += 1
-            let elapsed = Date().timeIntervalSince(artworkMissSince)
-            let giveUp = artworkMisses >= Self.maxArtworkMisses
-                || elapsed >= Self.artworkGiveUpAfter
-            if giveUp {
-                // 真的没有封面。记下结论，免得一直空转。
-                resolvedArtworkKey = key
-                artworkMisses = 0
-            }
+            var base: TimeInterval = 0.5
+            if case .noArtwork = result { base = 2 }
+            let backoff = min(Self.artworkRetryCap,
+                              base * pow(2, Double(max(0, attempts - 1))))
+            nextAttemptAt = Date().addingTimeInterval(backoff)
             if logEnabled {
-                NSLog("[NP] artwork miss key=%@ tries=%d elapsed=%.1fs giveUp=%@",
-                      key, artworkMisses, elapsed, String(giveUp))
+                NSLog("[NP] artwork miss try=%d backoff=%.1fs reason=%@",
+                      attempts, backoff, Self.describe(lastArtworkReason))
             }
         }
+
+        // 读完就擦掉，别让封面图一直躺在临时目录里
+        try? FileManager.default.removeItem(atPath: artworkPath)
 
         s.artwork = cachedArtwork
         s.palette = cachedPalette
         return s
     }
 
-    /// 让播放器把封面写到临时文件，返回**它当时正在播的那首曲名**。
+    /// 上一次失败的原因，只用于日志
+    private var lastArtworkReason: ArtworkRead = .failed("-")
+
+    private static func describe(_ r: ArtworkRead) -> String {
+        switch r {
+        case .image: return "image"
+        case .noArtwork: return "no-artwork"
+        case .failed(let why): return "failed(\(why))"
+        }
+    }
+
+    /// 面板展开时调用：用户正看着这块地方，没封面就立刻再试一次，不等退避。
+    /// 退避最长 10 秒，而人展开面板只会等一两秒——没有这个入口，
+    /// 封面晚到的那次尝试就永远赶不上用户看它的那一刻。
+    func retryArtworkNow() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if self.attemptKey == self.resolvedArtworkKey, self.cachedArtwork != nil { return }
+            self.attempts = 0
+            self.nextAttemptAt = .distantPast
+            DispatchQueue.main.async { self.tick() }
+        }
+    }
+
+    /// 读一次封面。三种结果必须分开，否则「还没就绪」会被当成「这首没有封面」：
+    /// - `.image`：拿到图
+    /// - `.noArtwork`：播放器明确说这首没有 artwork（`count of artworks = 0`）
+    /// - `.failed`：脚本报错 / 超时 / 曲名对不上 / 图解不开——**临时故障，值得重试**
     ///
     /// 返回曲名是为了自证一致性：读元数据和读封面是两次 AppleScript 调用，
     /// 中间用户可能又切了一首。如果封面脚本报回的曲名和刚读到的元数据不一致，
     /// 这张图就不能认——否则会把 B 歌的封面挂到 A 歌名下，一直错到下次换曲。
-    ///
-    /// 返回 nil 表示没有封面可读（播放器没运行 / 没在播 / 这首没有 artwork）。
-    private func fetchArtwork(_ script: () -> String) -> String? {
-        let out = runOSA(script()) ?? ""
-        let parts = out.components(separatedBy: Self.fieldSeparator)
-        guard parts.count >= 2, parts[1] == "1" else { return nil }
-        return parts[0]
+    private func probeArtwork(expectedTitle: String) -> ArtworkRead {
+        guard let out = runOSA(artworkScriptMusic()) else {
+            return .failed("osascript-nil")
+        }
+        let f = out.components(separatedBy: Self.fieldSeparator)
+        guard f.count >= 3 else {
+            return .failed("parse:" + String(out.prefix(80)))
+        }
+        // 失败先按脚本自报的原因分类，再校验曲名——
+        // 否则「播放器刚停」这种正常情况会被误报成 title-mismatch。
+        if f[0] != "1" {
+            if f[2] == "no-artwork" { return .noArtwork }
+            if f[2] != "ok" { return .failed(f[2]) }
+        }
+        guard f[1] == expectedTitle else {
+            return .failed("title-mismatch")
+        }
+        guard let img = NSImage(contentsOfFile: artworkPath), img.size.width > 1 else {
+            // 脚本说写成功了，但 NSImage 解不开。把字节数带上，
+            // 下次再出问题可以直接判断是「空文件」还是「格式不认识」。
+            let attrs = try? FileManager.default.attributesOfItem(atPath: artworkPath)
+            let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? -1
+            return .failed("decode:\(bytes)B")
+        }
+        return .image(img)
     }
 
     private func artworkScriptMusic() -> String {
@@ -233,21 +296,29 @@ final class NowPlayingService {
             tell application "Music"
                 set ps to player state
                 if ps is playing or ps is paused then
-                    if (count of artworks of current track) > 0 then
-                        set sep to (ASCII character 31)
-                        set tname to name of current track
+                    set sep to (ASCII character 31)
+                    set tname to name of current track
+                    try
+                        if (count of artworks of current track) is 0 then
+                            return "0" & sep & tname & sep & "no-artwork"
+                        end if
                         set d to raw data of artwork 1 of current track
                         set p to POSIX file "\(artworkPath)"
                         set fh to open for access p with write permission
                         set eof fh to 0
                         write d to fh
                         close access fh
-                        return tname & sep & "1"
-                    end if
+                        return "1" & sep & tname & sep & "ok"
+                    on error errMsg number errNum
+                        try
+                            close access (POSIX file "\(artworkPath)")
+                        end try
+                        return "0" & sep & tname & sep & ("err " & errNum & ": " & errMsg)
+                    end try
                 end if
             end tell
         end if
-        return "0"
+        return "0" & (ASCII character 31) & "" & (ASCII character 31) & "not-playing"
         """
     }
 
@@ -305,10 +376,9 @@ final class NowPlayingService {
         }
         // 立刻刷新几次：界面不用等满 2 秒。
         //
-        // 只刷一次不够——切歌之后封面往往要几十到几百毫秒才就绪，
-        // 单次 0.35 秒的刷新很容易正好扑空，那一拍读到的就是「没有封面」。
-        // 分三拍能让界面尽快跟上，也把「封面恰好在第几拍就绪」这件事
-        // 交给 `attachArtwork` 的重试逻辑兜住。
+        // 这三拍只负责「让曲目信息尽快跟上」，**不再负责封面**：
+        // 它们注定早于封面就绪，所以 `attachArtwork` 对这几拍做了退避节流，
+        // 不会让它们吃掉任何一次真正的重试机会（见 `nextAttemptAt`）。
         for delay in [0.35, 0.9, 1.6] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.tick()
@@ -388,9 +458,10 @@ final class NowPlayingService {
     /// 验证封面重试状态机。**驱动的是真实的 `attachArtwork`**，
     /// 只是把 AppleScript 换成注入的闭包——不需要播放器，也不需要出声。
     ///
-    /// 守的核心不变式：**读失败时不能把这一首记成已解决**。
-    /// 一旦记了，后面每次轮询都会跳过读取、把「没有封面」当成结论，
-    /// 直到再换一首歌。那就是「点下一首没封面、再点几次又有了」的成因。
+    /// 守的两条不变式：
+    /// 1. **读失败时不能把这一首记成已解决**——记了，这一整首就再也不会重试。
+    /// 2. **切歌瞬间连刷的那几拍不能消耗重试预算**——它们注定扑空，
+    ///    吃掉预算就等于把重试窗口提前关掉，这正是「点下一首没封面」的成因。
     static func runSelfTest() -> Int {
         var failures = 0
         func check(_ name: String, _ ok: Bool) {
@@ -405,7 +476,6 @@ final class NowPlayingService {
         }
 
         // 造一张能真的被 NSImage 解出来的图
-        let png = NSTemporaryDirectory() + "limen-selftest-artwork.png"
         let probe = NSImage(size: NSSize(width: 8, height: 8))
         probe.lockFocus()
         NSColor.systemBlue.setFill()
@@ -420,57 +490,56 @@ final class NowPlayingService {
 
         let svc = NowPlayingService()
         var calls = 0
-        var reply: String? = nil
-        var deliverImage = false
-        let fetch: () -> String? = {
+        var deliver = false
+        let fetch: () -> ArtworkRead = {
             calls += 1
-            if deliverImage, let d = pngData {
-                try? d.write(to: URL(fileURLWithPath: svc.artworkPath))
-            }
-            return reply
+            if deliver, let d = pngData, let img = NSImage(data: d) { return .image(img) }
+            return .noArtwork
         }
         let keyB = "music|Song B|A"
 
         // ① 点下一首：播放器已换歌，封面还没解出来
-        reply = nil
-        deliverImage = false
         let miss = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
         check("① 封面未就绪时不显示图", miss.artwork == nil)
         check("① 确实尝试过读取", calls == 1)
 
-        // ② 下一次轮询：同一首，封面就绪 —— 必须**重试**才拿得到
-        reply = "Song B"
-        deliverImage = true
-        let before = calls
-        let hit = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
-        check("② 失败后同一首仍会重试", calls == before + 1)
-        check("② 重试拿到封面", hit.artwork != nil)
-        check("② 拿到封面后配色也生效", hit.palette != nil)
-
-        // ③ 同一首再轮询：走缓存，不再执行脚本
-        let before3 = calls
+        // ② 紧接着的抢跑拍（control() 的 0.35/0.9s）：必须被退避挡掉，
+        //    不能消耗重试机会——这条是本次的回归点
         _ = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
-        check("③ 已解决后不再调用脚本", calls == before3)
+        _ = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
+        _ = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
+        check("② 抢跑拍不再调用脚本", calls == 1)
 
-        // ④ 又切了一首，脚本报回的却是另一首的曲名（两次调用之间又换歌了）
-        reply = "Song D"
-        deliverImage = true
-        let mismatch = svc.attachArtwork(snapshot("Song C"), key: "music|Song C|A", fetch: fetch)
-        check("④ 曲名对不上时不采用这张图", mismatch.artwork == nil)
+        // ③ 退避窗口过去后：同一首仍在重试，并拿到封面
+        svc.nextAttemptAt = .distantPast
+        deliver = true
+        let hit = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
+        check("③ 失败后同一首仍会重试", calls == 2)
+        check("③ 重试拿到封面", hit.artwork != nil)
+        check("③ 拿到封面后配色也生效", hit.palette != nil)
 
-        // ⑤ 真的没有封面的歌：连续失败到上限后停止重试，不许无限空转
-        reply = nil
-        deliverImage = false
+        // ④ 同一首再轮询：走缓存，不再执行脚本
+        svc.nextAttemptAt = .distantPast
+        _ = svc.attachArtwork(snapshot("Song B"), key: keyB, fetch: fetch)
+        check("④ 已解决后不再调用脚本", calls == 2)
+
+        // ⑤ 换成一首迟迟没有封面的歌：连试 10 次都必须真的去试
+        //    （旧实现在第 6 次就永久判死，封面再也不会出现）
+        deliver = false
         let keyNoArt = "music|NoArt|A"
-        for _ in 0..<maxArtworkMisses {
+        for _ in 0..<10 {
+            svc.nextAttemptAt = .distantPast
             _ = svc.attachArtwork(snapshot("NoArt"), key: keyNoArt, fetch: fetch)
         }
-        let before5 = calls
-        _ = svc.attachArtwork(snapshot("NoArt"), key: keyNoArt, fetch: fetch)
-        check("⑤ 放弃之后不再空转", calls == before5)
+        check("⑤ 一直没封面也不会永久放弃", calls == 12)
+
+        // ⑥ 换曲必须重置：上一首的失败不能算到下一首头上
+        deliver = true
+        let keyC = "music|Song C|A"
+        let resumed = svc.attachArtwork(snapshot("Song C"), key: keyC, fetch: fetch)
+        check("⑥ 换曲后立刻重试并拿到图", resumed.artwork != nil && calls == 13)
 
         // 顺带清掉临时文件，别把痕迹留在磁盘上
-        try? FileManager.default.removeItem(atPath: png)
         try? FileManager.default.removeItem(atPath: svc.artworkPath)
 
         print(failures == 0 ? "\n封面逻辑全部通过" : "\n封面逻辑 \(failures) 项失败")
