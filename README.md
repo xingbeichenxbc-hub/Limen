@@ -6,9 +6,6 @@ Turn your Mac's notch into an on-demand player and AirDrop drop zone.
 
 **[⬇ 下载 Limen.dmg / Download · 1.4 MB](https://github.com/xingbeichenxbc-hub/Limen/releases/download/v0.11.2-beta/Limen.dmg)**
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d2dc7c1b-bde3-487d-b363-722c2fe02663" />
-
-
 | 中文 | English |
 |---|---|
 | 悬停刘海，展开封面、曲名与切歌；移开即收 | Hover the notch for artwork, track info and playback controls; it retracts when you leave |
